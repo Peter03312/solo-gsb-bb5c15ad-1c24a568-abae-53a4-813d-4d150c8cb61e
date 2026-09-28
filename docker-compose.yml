@@ -1,0 +1,26 @@
+services:
+  relic-case-api:
+    build: .
+    image: relic-case-changepoint-api:latest
+    container_name: relic-case-api
+    ports:
+      - "8080:8080"
+    environment:
+      # 启动所需配置（均有内置默认值；此处显式列出便于覆盖）
+      CASE_PORT: "8080"
+      CASE_DATA_DIR: "/app/data"
+      CASE_DB_URL: "sqlite:////app/data/cases.db"
+      CASE_PENALTY: "4.0"
+      CASE_MIN_SEGMENT_SIZE: "3"
+      CASE_ANCHOR_TOLERANCE: "300"
+    volumes:
+      - case-data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  case-data:
