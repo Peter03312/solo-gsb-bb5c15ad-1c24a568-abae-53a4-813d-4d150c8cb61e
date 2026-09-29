@@ -69,7 +69,9 @@ docker compose up --build
   代价相等时选择段数更少的切法。
 - 最小段长默认 3 个读数；被锚点强制切开的小区间会自动放宽。
 
-每段返回：`start_ts / end_ts`、样本数、温湿度均值与段内标准差、相对上一段的
+每段返回：`start_ts / end_ts`、样本数、温湿度均值与段内**总体标准差**
+（`temperature_std / humidity_std`，随快照持久化，重放/重复查询/重启后
+一致）、相对上一段的
 `delta_temperature / delta_humidity`、缩放加权的变化幅度 `magnitude`、置信标记
 `confidence`，以及是否由锚点界定（`start_anchored / end_anchored`）。
 
@@ -96,6 +98,35 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 读数可乱序、迟到补入。每次入库后，受影响展柜的**整条时间线重新分段**，
 覆盖旧的分段快照，版本号 `version` 单调递增。预览接口还会给出
 `affected_from_ts / affected_to_ts`（第一个发生变化的段起点 → 时间线末尾）。
+
+每段返回的 `temperature_std` / `humidity_std` 为该段读数的**总体标准差**
+（`sqrt(Σ(x−mean)²/N)`，单样本段为 `0`），在重放时随快照**一并落库**：
+重放响应、重放后的重复分段查询、服务重启后的分段查询三者逐字节一致；
+只有读数真正恒定时标准差才是 `0`，不会把未保存的统计值误回显为零。
+
+**历史快照的启动恢复（旧库自动迁移）**：旧版本快照表没有标准差列。
+服务启动（`init_db`）时幂等执行 `ALTER TABLE` 补建
+`temperature_std` / `humidity_std` 两列，并对缺失统计值的快照逐展柜
+**由库内对应读数核实后恢复**：段边界必须对应真实读数、段内读数条数与
+`sample_count` 一致、读数均值与快照均值一致，且全部读数恰好被各段完整
+划分；核实通过才把总体标准差写回。该恢复**不改动任何分段边界、样本数、
+均值或版本号**。若快照已无法由当前读数核实（例如读数被外部删除导致条数
+不足、均值对不上），该展柜的分段查询显式返回 `500`：
+
+```json
+{"detail": {"message": "展柜 CASE-X 版本 1 第 0 段快照需 8 条读数，当前读数仅 7 条可对应，标准差无法核实，拒绝以零值回显",
+            "device_sn": "CASE-X", "version": 1, "segment_index": 0,
+            "reason": "sample_count_mismatch"}}
+```
+
+`reason` 取值：`no_readings`（有快照无读数）、`sample_count_mismatch`
+（段内读数条数与快照不符）、`boundary_reading_missing`（段边界时刻无
+对应读数）、`mean_mismatch`（读数均值与快照均值不一致）、
+`partition_incomplete` / `partition_span_mismatch` / `partition_overlap` /
+`partition_disjoint`
+（各段未完整、不重叠地覆盖全部读数）、`segment_index_gap`（段下标不连续）。
+遇到该错误应核对读数后重新上报/重放该展柜；服务**绝不**把缺失统计
+静默当作真实零值，也不会暗中改变分段或推进版本。
 
 ### 4. 锚点校准
 
@@ -638,6 +669,63 @@ curl 'http://localhost:8080/api/v1/peer-baseline-deviation?target_sn=CASE-007&pe
 | DELETE | `/api/v1/cases/{sn}/anchors/{ts}` | 删除锚点并重放 |
 | POST | `/api/v1/replay/preview?device_sn=...` | 无写库重放预览 |
 | GET  | `/health` | 健康检查 |
+
+### 查询分段（段标准差随快照持久化）
+
+重放响应中的 `segments[].temperature_std / humidity_std` 是该段读数的总体
+标准差；重放之后再次查询（包括服务重启后）返回的值与该次重放完全相同，
+不必重新重放即可核对：
+
+```bash
+# 上报后立即拿到重放结果
+curl -X POST http://localhost:8080/api/v1/readings/batch \
+  -H 'Content-Type: application/json' \
+  -d '{"readings": [
+    {"device_sn": "CASE-007", "ts": "2026-09-01T08:00:00Z", "temperature": 20.0, "humidity": 50.0},
+    {"device_sn": "CASE-007", "ts": "2026-09-01T08:10:00Z", "temperature": 20.4, "humidity": 51.0},
+    {"device_sn": "CASE-007", "ts": "2026-09-01T08:20:00Z", "temperature": 19.6, "humidity": 49.0}
+  ]}'
+
+# 任意时刻重复查询（支持 start/end 过滤）；std 与重放一致
+curl 'http://localhost:8080/api/v1/cases/CASE-007/segments'
+```
+
+```json
+{
+  "device_sn": "CASE-007",
+  "version": 1,
+  "penalty": 4.0,
+  "sample_count": 3,
+  "anchor_count": 0,
+  "total_cost": 0.1599999999999966,
+  "replayed": false,
+  "replayed_at": "2026-09-29T00:00:00.000000Z",
+  "unmatched_anchors": [],
+  "segments": [
+    {
+      "index": 0,
+      "start_ts": "2026-09-01T08:00:00Z",
+      "end_ts": "2026-09-01T08:20:00Z",
+      "sample_count": 3,
+      "mean_temperature": 20.0,
+      "mean_humidity": 50.0,
+      "temperature_std": 0.3265986323710904,
+      "humidity_std": 0.816496580927726,
+      "delta_temperature": 0.0,
+      "delta_humidity": 0.0,
+      "magnitude": 0.0,
+      "confidence": "baseline",
+      "start_anchored": false,
+      "end_anchored": false,
+      "cost": 0.32000000000000006
+    }
+  ]
+}
+```
+
+服务启动时会自动为旧库补建标准差列并按读数核实恢复历史快照（规则见
+[核心行为 §3](#3-迟到读数与时间线重放)）；旧快照无法由读数核实时该接口
+返回 `500` 并在 `detail.reason` 中给出原因，不会把缺失值回显成零。
 
 ### 上报读数
 

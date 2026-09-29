@@ -6,7 +6,7 @@ import datetime as dt
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -40,6 +40,7 @@ from .schemas import (
     TimelineOut,
 )
 from .segmentation import Sample, segment_samples
+from .snapshot_heal import UnverifiableSnapshotError
 from .timeline import ForcedPointsOverflow
 
 
@@ -81,7 +82,7 @@ app = FastAPI(
         "与基线差的绝对值达到阈值即标记偏离，连续标记合并为时段并按最短持续"
         "时间过滤，返回最大偏离、峰值时刻与方向（只读）。"
     ),
-    version="1.10.0",
+    version="1.10.1",
     lifespan=lifespan,
 )
 
@@ -96,6 +97,29 @@ def get_db():
 
 def _parse_ts(value: dt.datetime | None) -> dt.datetime | None:
     return to_utc(value) if value is not None else None
+
+
+@app.exception_handler(UnverifiableSnapshotError)
+def _unverifiable_snapshot_handler(_request, exc: UnverifiableSnapshotError):
+    """旧快照无法由当前读数核实：显式 500，绝不以零值冒充统计结果。
+
+    分段边界、样本数、版本号保持原样返回的承诺在此被数据完整性破坏，
+    属于服务器端数据错误而非请求参数问题，故使用 500 并在 detail 中
+    给出展柜、版本、段下标与具体原因，便于按读数排查/重新重放。
+    """
+    detail: dict[str, object] = {
+        "message": str(exc),
+        "device_sn": exc.device_sn,
+        "reason": exc.reason,
+    }
+    if exc.version is not None:
+        detail["version"] = exc.version
+    if exc.segment_index is not None:
+        detail["segment_index"] = exc.segment_index
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={"detail": detail},
+    )
 
 
 def _propagation_params_422(exc: PropagationParamsError) -> HTTPException:

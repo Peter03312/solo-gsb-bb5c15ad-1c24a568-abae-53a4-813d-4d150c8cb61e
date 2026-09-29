@@ -134,6 +134,10 @@ class SegmentSnapshot(Base):
     sample_count: Mapped[int] = mapped_column(Integer, nullable=False)
     mean_temperature: Mapped[float] = mapped_column(Float, nullable=False)
     mean_humidity: Mapped[float] = mapped_column(Float, nullable=False)
+    # 两维总体标准差（sqrt(Σ(x−mean)²/N)）；旧库历史快照行没有该列/值，
+    # 为 NULL 时由 snapshot_heal 按对应读数核实后恢复，绝不直接当 0 回显
+    temperature_std: Mapped[float | None] = mapped_column(Float, nullable=True)
+    humidity_std: Mapped[float | None] = mapped_column(Float, nullable=True)
     delta_temperature: Mapped[float] = mapped_column(Float, nullable=False)
     delta_humidity: Mapped[float] = mapped_column(Float, nullable=False)
     magnitude: Mapped[float] = mapped_column(Float, nullable=False)
@@ -162,3 +166,8 @@ def init_db() -> None:
     if settings.DB_URL.startswith("sqlite") and ":memory:" not in settings.DB_URL:
         settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(bind=engine)
+    # 为旧库补建标准差列并从读数核实恢复历史快照统计（幂等；
+    # 延迟导入避免 database ↔ snapshot_heal 循环依赖）
+    from .snapshot_heal import migrate_and_heal
+
+    migrate_and_heal(engine)

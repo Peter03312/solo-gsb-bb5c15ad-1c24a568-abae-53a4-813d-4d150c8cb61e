@@ -18,6 +18,7 @@ from . import propagation as prop
 from . import recovery as rec
 from . import sampling as samp
 from . import segmentation as seg
+from . import snapshot_heal
 from . import timeline as tl
 from .config import settings
 from .database import Anchor, CaseState, Reading, SegmentSnapshot, to_utc, utcnow
@@ -144,11 +145,15 @@ def get_stored_segmentation(db: Session, device_sn: str) -> SegmentationOut | No
         replayed=False,
         replayed_at=to_utc(state.replayed_at) if state.replayed_at else None,
         unmatched_anchors=[],
-        segments=[_snapshot_to_out(r, i) for i, r in enumerate(rows)],
+        segments=[_snapshot_to_out(db, r, i) for i, r in enumerate(rows)],
     )
 
 
-def _snapshot_to_out(r: SegmentSnapshot, i: int) -> SegmentOut:
+def _snapshot_to_out(db: Session, r: SegmentSnapshot, i: int) -> SegmentOut:
+    # 标准差必须与该次重放一致：新快照直接取保存值；旧快照缺列时由
+    # 对应读数核实恢复（绝不把缺失值硬编码为 0）。核实失败会抛
+    # UnverifiableSnapshotError，由接口层转成显式错误响应。
+    t_std, h_std = snapshot_heal.segment_std(db, r)
     return SegmentOut(
         index=i,
         start_ts=to_utc(r.start_ts),
@@ -156,8 +161,8 @@ def _snapshot_to_out(r: SegmentSnapshot, i: int) -> SegmentOut:
         sample_count=r.sample_count,
         mean_temperature=r.mean_temperature,
         mean_humidity=r.mean_humidity,
-        temperature_std=0.0,
-        humidity_std=0.0,
+        temperature_std=t_std,
+        humidity_std=h_std,
         delta_temperature=r.delta_temperature,
         delta_humidity=r.delta_humidity,
         magnitude=r.magnitude,
@@ -249,6 +254,8 @@ def _persist(db: Session, result: seg.SegmentationResult, state: CaseState) -> N
                 sample_count=s.sample_count,
                 mean_temperature=s.mean_temperature,
                 mean_humidity=s.mean_humidity,
+                temperature_std=s.temperature_std,
+                humidity_std=s.humidity_std,
                 delta_temperature=s.delta_temperature,
                 delta_humidity=s.delta_humidity,
                 magnitude=s.magnitude,
