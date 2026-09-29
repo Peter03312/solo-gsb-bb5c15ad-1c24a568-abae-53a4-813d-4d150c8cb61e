@@ -73,6 +73,11 @@ docker compose up --build
 `delta_temperature / delta_humidity`、缩放加权的变化幅度 `magnitude`、置信标记
 `confidence`，以及是否由锚点界定（`start_anchored / end_anchored`）。
 
+段内标准差 `temperature_std / humidity_std` 是该段读数的**总体标准差**
+（除以样本数 n，非恒定读数段为正值、恒定段为 `0.0`），与分段计算同一口径。
+重放时两维统计值随分段一起持久化：**重放响应、重放后的重复分段查询、
+服务重启后的查询返回完全相同的值**，不会在读取快照时被回显为零。
+
 **置信标记**（段首段为 `baseline`）依据相邻两段跳变相对其局部噪声的倍数：
 
 | 标记 | 规则 |
@@ -96,6 +101,32 @@ new_mean = (old_mean × report_count + value) / (report_count + 1)
 读数可乱序、迟到补入。每次入库后，受影响展柜的**整条时间线重新分段**，
 覆盖旧的分段快照，版本号 `version` 单调递增。预览接口还会给出
 `affected_from_ts / affected_to_ts`（第一个发生变化的段起点 → 时间线末尾）。
+
+也可以不新增读数，直接对某展柜以当前读数/锚点显式重放：
+
+```
+POST /api/v1/cases/{sn}/replay            # 沿用已保存惩罚项
+POST /api/v1/cases/{sn}/replay?penalty=6  # 本次覆盖惩罚项
+```
+
+显式重放仅当重算分段相对已存储快照**实际变化**（首次重放、数据/锚点变化、
+惩罚项变化）时才递增版本；数据未变的重复重放只刷新快照（例如补齐两维
+标准差），不制造新版本。无读数的展柜返回 `404`。
+
+#### 旧库分段快照的标准差恢复
+
+旧版本只持久化均值、不持久化 `temperature_std / humidity_std`，读取快照时
+两列被固定回显为 `0`（非恒定读数因此在后续查询中被误判为无波动）。服务启动
+（`init_db`）会幂等补列，并对历史快照按其覆盖的读数窗口重算两维**总体标准差**：
+
+- 仅当快照下标连续、分段首尾相接恰好覆盖全部读数，且每段 `sample_count`、
+  温湿度均值、加权代价都与窗口读数重算值一致时，才**只补写这两列**——
+  分段边界、段数、版本号及其余字段一律不动；
+- 快照读数已无法对应（读数被删改、快照结构不完整、均值/代价对不上）时，
+  保留缺失值，相关分段查询返回 **`409 Conflict`** 并说明原因与修复方式，
+  **绝不把缺失值当作真实零值回显**，也不会在读取路径上暗中改分段或版本；
+  对该展柜调用 `POST /api/v1/cases/{sn}/replay` 以当前读数重建快照后即恢复，
+  随后重复查询与重启后查询均与重放结果一致。
 
 ### 4. 锚点校准
 
@@ -622,6 +653,7 @@ curl 'http://localhost:8080/api/v1/peer-baseline-deviation?target_sn=CASE-007&pe
 | POST | `/api/v1/readings/batch` | 批量上报，自动合并重复并重放受影响展柜 |
 | GET  | `/api/v1/cases` | 展柜列表（版本、读数/锚点数） |
 | GET  | `/api/v1/cases/{sn}/segments` | 查询分段，支持 `start` / `end` 时间过滤 |
+| POST | `/api/v1/cases/{sn}/replay` | 以当前读数/锚点显式重放（分段无变化不升版本；可修复旧快照统计） |
 | GET  | `/api/v1/cases/{sn}/timeline?max_points=...` | 时间线降采样读数，支持 `start` / `end` 时间过滤 |
 | GET  | `/api/v1/cases/{sn}/excursions` | 越界剂量事件：线性插值交点、分维剂量积分、`max_gap` 断开 |
 | GET  | `/api/v1/cases/{sn}/exposure-budget` | 累计越界剂量预算：窗末累计量、剩余额度与首次达到预算的精确时刻 |
@@ -663,6 +695,36 @@ curl -X POST http://localhost:8080/api/v1/anchors \
   -H 'Content-Type: application/json' \
   -d '{"device_sn": "CASE-007", "ts": "2026-09-01T09:00:00+08:00",
        "label": "更换调湿剂", "ref_temperature": 21.0, "ref_humidity": 60.0}'
+```
+
+### 显式重放并核对段内标准差
+
+```bash
+# 以当前读数/锚点重放（分段无变化时不递增版本，仅刷新快照）
+curl -X POST http://localhost:8080/api/v1/cases/CASE-007/replay
+
+# 分段查询返回的两维总体标准差与重放响应一致，重启后亦相同
+curl -s http://localhost:8080/api/v1/cases/CASE-007/segments \
+  | python3 -c 'import json,sys; [print(s["index"], s["sample_count"],
+              s["temperature_std"], s["humidity_std"])
+              for s in json.load(sys.stdin)["segments"]]'
+```
+
+重放响应（节选）：
+
+```json
+{"device_sn": "CASE-007", "version": 2, "replayed": true,
+ "segments": [{"index": 0, "sample_count": 3,
+               "mean_temperature": 20.07, "temperature_std": 0.249,
+               "mean_humidity": 55.0, "humidity_std": 0.327, "...": "..."}]}
+```
+
+旧库快照若已无法由现有读数核实，分段查询返回 `409`：
+
+```json
+{"detail": {"message": "展柜 CASE-007 的旧分段快照统计值无法由现有读数核实：……",
+            "device_sn": "CASE-007", "reason": "……",
+            "remediation": "POST /api/v1/cases/CASE-007/replay 以当前读数重放重建快照"}}
 ```
 
 ### 迟到读数预览（不写库）
@@ -1085,7 +1147,10 @@ python -m pytest -q
 ```
 
 测试覆盖：变点检出与置信标记、惩罚项单调性、确定性、重复合并、迟到重放、
-锚点强制边界、时间范围查询、**预览不写库**（含待预览读数与库内重复、
+锚点强制边界、时间范围查询、**段内总体标准差持久化与旧快照恢复**（即时重放与
+重复/重启后查询两维 std 完全一致、恒定段为真实零值而非缺失、旧库无 std 列时
+启动幂等补列并按读数核实回写且不动分段/版本、快照与读数无法对应时 409 且可经
+显式重放修复、显式重放无变化不升版本）、**预览不写库**（含待预览读数与库内重复、
 请求内时间戳重复时在内存副本上按 `report_count` 累计均值的回归用例），
 **时间线降采样**（比例配额与余数稳定分派、强制点去重超预算返回 422 与
 `minimum_required`、确定性 LTTB、`start` / `end` 过滤后的极值与预算），以及

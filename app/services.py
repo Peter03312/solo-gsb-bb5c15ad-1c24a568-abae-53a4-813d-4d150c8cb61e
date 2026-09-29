@@ -18,6 +18,7 @@ from . import propagation as prop
 from . import recovery as rec
 from . import sampling as samp
 from . import segmentation as seg
+from . import snapshot_recovery as srec
 from . import timeline as tl
 from .config import settings
 from .database import Anchor, CaseState, Reading, SegmentSnapshot, to_utc, utcnow
@@ -129,11 +130,32 @@ def serialize_result(
     )
 
 
-def get_stored_segmentation(db: Session, device_sn: str) -> SegmentationOut | None:
+def get_stored_segmentation(
+    db: Session, device_sn: str, recover_legacy: bool = True
+) -> SegmentationOut | None:
     state = db.get(CaseState, device_sn)
     rows = _snapshot_rows(db, device_sn)
     if state is None or not rows:
         return None
+
+    if any(r.temperature_std is None or r.humidity_std is None for r in rows):
+        if not recover_legacy:
+            return None
+        # 旧快照缺失两维统计列：先按现有读数核实补写；无法对应则明确报错，
+        # 绝不把缺失值当作真实零值回显，也不改变分段与版本
+        if not srec.backfill_device(db, device_sn, commit=True):
+            _, reason = srec.verify_device(db, device_sn)
+            raise srec.SnapshotStatsUnverifiable(device_sn, reason or "快照与读数无法对应")
+        db.expire_all()
+        state = db.get(CaseState, device_sn)
+        rows = _snapshot_rows(db, device_sn)
+
+    return _assemble_stored_segmentation(db, device_sn, state, rows)
+
+
+def _assemble_stored_segmentation(
+    db: Session, device_sn: str, state: CaseState, rows: list[SegmentSnapshot]
+) -> SegmentationOut:
     return SegmentationOut(
         device_sn=device_sn,
         version=state.version,
@@ -148,7 +170,12 @@ def get_stored_segmentation(db: Session, device_sn: str) -> SegmentationOut | No
     )
 
 
-def _snapshot_to_out(r: SegmentSnapshot, i: int) -> SegmentOut:
+def _snapshot_to_out(r: SegmentSnapshot, i: int, *, allow_missing_std: bool = False) -> SegmentOut:
+    if not allow_missing_std and (r.temperature_std is None or r.humidity_std is None):
+        # 缺失统计不得被静默当作零：正常读取路径必须先经旧快照核实恢复
+        raise srec.SnapshotStatsUnverifiable(
+            r.device_sn, "快照两维标准差缺失，且尚未经读数核实"
+        )
     return SegmentOut(
         index=i,
         start_ts=to_utc(r.start_ts),
@@ -156,8 +183,10 @@ def _snapshot_to_out(r: SegmentSnapshot, i: int) -> SegmentOut:
         sample_count=r.sample_count,
         mean_temperature=r.mean_temperature,
         mean_humidity=r.mean_humidity,
-        temperature_std=0.0,
-        humidity_std=0.0,
+        # 两维总体标准差随快照持久化；allow_missing_std 仅供不比较 std 的
+        # 结构差异计算使用（如旧快照修复重放前的分段对比），不用于响应
+        temperature_std=0.0 if r.temperature_std is None else r.temperature_std,
+        humidity_std=0.0 if r.humidity_std is None else r.humidity_std,
         delta_temperature=r.delta_temperature,
         delta_humidity=r.delta_humidity,
         magnitude=r.magnitude,
@@ -249,6 +278,8 @@ def _persist(db: Session, result: seg.SegmentationResult, state: CaseState) -> N
                 sample_count=s.sample_count,
                 mean_temperature=s.mean_temperature,
                 mean_humidity=s.mean_humidity,
+                temperature_std=s.temperature_std,
+                humidity_std=s.humidity_std,
                 delta_temperature=s.delta_temperature,
                 delta_humidity=s.delta_humidity,
                 magnitude=s.magnitude,
@@ -300,6 +331,69 @@ def recompute_if_needed(
     if count == 0:
         return None
     return replay_device(db, device_sn, penalty=penalty)
+
+
+def replay_case(
+    db: Session, device_sn: str, penalty: float | None = None
+) -> SegmentationOut | None:
+    """对单个展柜以当前读数/锚点显式重放（旧快照统计不可核实后的修复入口）。
+
+    与入库自动重放不同：仅当重算分段相对已存储快照**实际发生变化**
+    （含首次重放、惩罚项变化）时才递增版本号；数据未变的重复重放只
+    刷新快照（补齐两维标准差），不制造新版本、不改分段。旧快照缺失
+    两维统计列时，按重算结果的结构/均值判定是否变化，缺失统计本身
+    不构成版本递增理由。无读数返回 None。
+    """
+    result = _compute(db, device_sn, penalty=penalty)
+    if result.sample_count == 0:
+        return None
+
+    state = db.get(CaseState, device_sn)
+    rows = _snapshot_rows(db, device_sn)
+    legacy_missing = bool(
+        rows and any(r.temperature_std is None or r.humidity_std is None for r in rows)
+    )
+    base_version = state.version if state is not None else 0
+
+    if state is None or not rows:
+        changed = True
+    else:
+        # 旧快照缺统计列时放宽 std 缺失（只按结构/均值比较），不触发核实报错；
+        # 缺失统计本身不构成版本递增理由
+        if legacy_missing:
+            current = SegmentationOut(
+                device_sn=device_sn,
+                version=state.version,
+                penalty=state.penalty,
+                sample_count=state.reading_count,
+                anchor_count=_count_anchors(db, device_sn),
+                total_cost=sum(r.cost for r in rows),
+                replayed=False,
+                replayed_at=None,
+                unmatched_anchors=[],
+                segments=[
+                    _snapshot_to_out(r, i, allow_missing_std=True)
+                    for i, r in enumerate(rows)
+                ],
+            )
+        else:
+            current = _assemble_stored_segmentation(db, device_sn, state, rows)
+        candidate = serialize_result(result, base_version + 1, True, None)
+        changed = _segmentation_differs(current, candidate)
+
+    if state is None:
+        state = CaseState(device_sn=device_sn, version=0, penalty=result.penalty)
+        db.add(state)
+    if penalty is not None:
+        state.penalty = result.penalty
+    if changed:
+        state.version += 1
+    state.reading_count = result.sample_count
+    state.replayed_at = utcnow()
+
+    _persist(db, result, state)
+    db.flush()
+    return serialize_result(result, state.version, True, to_utc(state.replayed_at))
 
 
 # ---------- 锚点 ----------

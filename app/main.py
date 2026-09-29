@@ -6,7 +6,7 @@ import datetime as dt
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -16,6 +16,7 @@ from .excursions import Thresholds
 from .propagation import PropagationParamsError, normalize_time_params
 from .recovery import InsufficientBaselineSamples
 from .sampling import SamplingParamsError, resolve_sampling_params
+from .snapshot_recovery import SnapshotStatsUnverifiable
 from .schemas import (
     AnchorIn,
     AnchorOut,
@@ -81,7 +82,7 @@ app = FastAPI(
         "与基线差的绝对值达到阈值即标记偏离，连续标记合并为时段并按最短持续"
         "时间过滤，返回最大偏离、峰值时刻与方向（只读）。"
     ),
-    version="1.10.0",
+    version="1.11.0",
     lifespan=lifespan,
 )
 
@@ -117,6 +118,22 @@ def _sampling_params_422(exc: SamplingParamsError) -> HTTPException:
         detail["actual"] = exc.actual
     return HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=detail
+    )
+
+
+@app.exception_handler(SnapshotStatsUnverifiable)
+async def _snapshot_stats_exception_handler(_request, exc: SnapshotStatsUnverifiable):
+    # 所有依赖分段快照的查询（分段/时间线/共模突变/预览等）统一 409
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={
+            "detail": {
+                "message": str(exc),
+                "device_sn": exc.device_sn,
+                "reason": exc.reason,
+                "remediation": f"POST /api/v1/cases/{exc.device_sn}/replay 以当前读数重放重建快照",
+            }
+        },
     )
 
 
@@ -886,6 +903,29 @@ def remove_anchor(
     if not services.delete_anchor(db, device_sn, anchor_ts):
         raise HTTPException(status_code=404, detail="锚点不存在")
     out = services.replay_device(db, device_sn, changed=True)
+    db.commit()
+    return out
+
+
+# ---------- 显式重放 ----------
+
+
+@app.post(
+    "/api/v1/cases/{device_sn}/replay",
+    response_model=SegmentationOut,
+    tags=["replay"],
+    summary="以当前读数/锚点重放某展柜（修复旧快照统计、重建分段快照）",
+)
+def replay_case(
+    device_sn: str,
+    penalty: float | None = Query(
+        None, ge=0.0, description="本次重放使用的惩罚项；缺省沿用展柜已保存值或默认值"
+    ),
+    db: Session = Depends(get_db),
+):
+    out = services.replay_case(db, device_sn, penalty=penalty)
+    if out is None:
+        raise HTTPException(status_code=404, detail="展柜不存在或尚无读数")
     db.commit()
     return out
 

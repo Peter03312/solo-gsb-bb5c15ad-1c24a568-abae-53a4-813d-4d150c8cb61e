@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 
 from sqlalchemy import (
     JSON,
@@ -16,6 +17,8 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
     event,
+    inspect,
+    text,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -55,6 +58,8 @@ def _build_engine():
 
 engine = _build_engine()
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+logger = logging.getLogger("app.database")
 
 
 class Base(DeclarativeBase):
@@ -141,6 +146,10 @@ class SegmentSnapshot(Base):
     start_anchored: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     end_anchored: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     cost: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    # 两维段内总体标准差（°C / %RH）；旧库快照没有这两列，可为 NULL，
+    # 由启动迁移/读取时按读数核实后补写；NULL 表示统计值缺失、不可回显为零
+    temperature_std: Mapped[float | None] = mapped_column(Float, nullable=True)
+    humidity_std: Mapped[float | None] = mapped_column(Float, nullable=True)
 
 
 class CaseState(Base):
@@ -156,9 +165,36 @@ class CaseState(Base):
     extra: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
 
+def _ensure_snapshot_std_columns(bind) -> None:
+    """旧库补列：segment_snapshots 增加两维标准差（NULLABLE，幂等）。
+
+    旧版快照没有这两列，历史行补列后为 NULL；统计值的核实与回补由
+    :mod:`app.snapshot_recovery` 完成，缺失值在恢复成功前不得当作零。
+    """
+    inspector = inspect(bind)
+    if "segment_snapshots" not in inspector.get_table_names():
+        return
+    columns = {c["name"] for c in inspector.get_columns("segment_snapshots")}
+    with bind.begin() as conn:
+        if "temperature_std" not in columns:
+            conn.execute(text("ALTER TABLE segment_snapshots ADD COLUMN temperature_std FLOAT"))
+        if "humidity_std" not in columns:
+            conn.execute(text("ALTER TABLE segment_snapshots ADD COLUMN humidity_std FLOAT"))
+
+
 def init_db() -> None:
     # SQLite 文件库：确保数据目录存在（Docker 镜像已预建 /app/data，
     # 本地裸跑或自定义 CASE_DATA_DIR 时由这里兜底）
     if settings.DB_URL.startswith("sqlite") and ":memory:" not in settings.DB_URL:
         settings.DATA_DIR.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(bind=engine)
+    _ensure_snapshot_std_columns(engine)
+
+    # 旧快照的两维标准差按现有读数核实后补写；无法核实的保留 NULL，
+    # 读取分段时由接口明确报错（单柜失败不阻断启动）。
+    from .snapshot_recovery import recover_all
+
+    with SessionLocal() as session:
+        summary = recover_all(session)
+    for device_sn, status in summary.items():
+        logger.info("旧快照统计恢复 %s: %s", device_sn, status)
